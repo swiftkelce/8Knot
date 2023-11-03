@@ -18,15 +18,15 @@ import math
 import numpy as np
 
 
-PAGE = "chaoss"
-VIZ_ID = "project-velocity"
+PAGE = "chaoss_1"
+VIZ_ID = "tt-first-response"
 
-gc_project_velocity = dbc.Card(
+gc_tt_first_response = dbc.Card(
     [
         dbc.CardBody(
             [
                 html.H3(
-                    "Project Velocity",
+                    "Time to First Response",
                     className="card-title",
                     style={"textAlign": "center"},
                 ),
