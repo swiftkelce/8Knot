@@ -103,7 +103,7 @@ def toggle_popover(n, is_open):
     return is_open
 
 
-# callback for VIZ TITLE graph
+# callback for VIZ TITLE graphx
 @callback(
     Output(f"{PAGE}-{VIZ_ID}", "figure"),
     [
