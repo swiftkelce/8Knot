@@ -20,7 +20,7 @@ QUERY_NAME = "CNTRB_PER_FILE"
 def cntrb_per_file_query(self, repos):
     """
     (Worker Query)
-    Executes SQL query against Augur database for contributor data.
+    Executes SQL query against Augur database to get contributors per file data.
 
     Args:
     -----

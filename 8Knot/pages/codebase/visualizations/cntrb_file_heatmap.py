@@ -18,6 +18,7 @@ from cache_manager.cache_manager import CacheManager as cm
 from pages.utils.job_utils import nodata_graph
 import time
 from dash.exceptions import PreventUpdate
+import app
 
 PAGE = "codebase"
 VIZ_ID = "cntrb-file-heatmap"
@@ -28,7 +29,17 @@ graph_loading = html.Div(
         dbc.Popover(
             [
                 dbc.PopoverHeader("Graph Info:"),
-                dbc.PopoverBody("INSERT CONTEXT OF GRAPH HERE"),
+                dbc.PopoverBody(
+                    """
+                    This visualization analyzes the activity of the contributors to sub-sections (files or folders)
+                    of a repository. Specifically, this heatmap identifies the last time a sub-section's contributors
+                    (those people who have opened at least one pull request to a sub-section) last contributed to the
+                    repository. See the definition of "contribution" on the Info page for more information. This could be
+                    interpreted as monitoring technical knowledge retention of codebase components: if a sub-section's
+                    past contributors are no longer active in the repository, maintainership of that sub-section could
+                    be insufficient and require attention.
+                    """
+                ),
             ],
             id=f"popover-{PAGE}-{VIZ_ID}",
             target=f"popover-target-{PAGE}-{VIZ_ID}",
@@ -52,6 +63,7 @@ graph_loading = html.Div(
                                     placeholder="Repo for Heatmap",
                                     classNames={"values": "dmc-multiselect-custom"},
                                     searchable=True,
+                                    clearable=True,
                                 ),
                             ],
                             className="me-2",
@@ -67,6 +79,7 @@ graph_loading = html.Div(
                                     id=f"directory-{PAGE}-{VIZ_ID}",
                                     classNames={"values": "dmc-multiselect-custom"},
                                     searchable=True,
+                                    clearable=True,
                                 ),
                             ],
                             className="me-2",
@@ -147,7 +160,7 @@ def repo_dropdown(repo_ids):
 )
 def directory_dropdown(repo_id):
     # wait for data to asynchronously download and become available.
-    print(repo_id)
+
     cache = cm()
     df = cache.grabm(func=rfq, repos=[repo_id])
     while df is None:
@@ -186,8 +199,11 @@ def directory_dropdown(repo_id):
     top_level_files = df["file_name"][df[1].isnull()].tolist()
     directories = [f for f in directories if f not in top_level_files]
 
+    # sort alphabetically
+    directories = sorted(directories)
+
     # add top level directory to the list of directories
-    directories.append("Top Level Directory")
+    directories.insert(0, "Top Level Directory")
 
     return directories, "Top Level Directory"
 
@@ -198,10 +214,11 @@ def directory_dropdown(repo_id):
     [
         Input(f"repo-{PAGE}-{VIZ_ID}", "value"),
         Input(f"directory-{PAGE}-{VIZ_ID}", "value"),
+        Input("bot-switch", "value"),
     ],
     background=True,
 )
-def cntrb_file_heatmap_graph(repo_id, directory):
+def cntrb_file_heatmap_graph(repo_id, directory, bot_switch):
     # wait for data to asynchronously download and become available.
     cache = cm()
 
@@ -230,7 +247,7 @@ def cntrb_file_heatmap_graph(repo_id, directory):
         return nodata_graph
 
     # function for all data pre processing
-    df = process_data(df_file, df_actions, df_file_cntbs, directory)
+
 
     fig = create_figure(df)
 
@@ -238,7 +255,7 @@ def cntrb_file_heatmap_graph(repo_id, directory):
     return fig
 
 
-def process_data(df_file: pd.DataFrame, df_actions: pd.DataFrame, df_file_cntbs: pd.DataFrame, directory):
+def process_data(df_file: pd.DataFrame, df_actions: pd.DataFrame, df_file_cntbs: pd.DataFrame, directory, bot_switch):
 
     # strings to hold the values for each column (always the same for every row of this query)
     repo_name = df_file["repo_name"].iloc[0]
@@ -269,11 +286,17 @@ def process_data(df_file: pd.DataFrame, df_actions: pd.DataFrame, df_file_cntbs:
     # replace nan with empty string to avoid errors in list comprehension
     df_file.cntrb_ids.fillna("", inplace=True)
 
-    # reformat cntrb_ids to list
-    df_file["cntrb_ids"] = df_file.apply(
-        lambda row: [x for x in row.cntrb_ids],
-        axis=1,
-    )
+    # reformat cntrb_ids to list and remove bots if filter is on
+    if bot_switch:
+        df_file["cntrb_ids"] = df_file.apply(
+            lambda row: [x for x in row.cntrb_ids if x not in app.bots_list],
+            axis=1,
+        )
+    else:
+        df_file["cntrb_ids"] = df_file.apply(
+            lambda row: [x for x in row.cntrb_ids],
+            axis=1,
+        )
 
     # determine directory level to use in later step
     level = directory.count("/")

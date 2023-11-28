@@ -19,11 +19,9 @@ QUERY_NAME = "REPO_FILES"
 )
 def repo_files_query(self, repos):
 
-    print("inside query")
-    print(repos)
     """
     (Worker Query)
-    Executes SQL query against Augur database for contributor data.
+    Executes SQL query against Augur database to get the repo file data.
 
     Args:
     -----
