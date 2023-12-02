@@ -160,7 +160,6 @@ def repo_dropdown(repo_ids):
 )
 def directory_dropdown(repo_id):
     # wait for data to asynchronously download and become available.
-
     cache = cm()
     df = cache.grabm(func=rfq, repos=[repo_id])
     while df is None:
@@ -247,7 +246,7 @@ def cntrb_file_heatmap_graph(repo_id, directory, bot_switch):
         return nodata_graph
 
     # function for all data pre processing
-
+    df = process_data(df_file, df_actions, df_file_cntbs, directory, bot_switch)
 
     fig = create_figure(df)
 

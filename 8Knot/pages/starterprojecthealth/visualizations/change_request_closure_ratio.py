@@ -18,15 +18,15 @@ import math
 import numpy as np
 
 
-PAGE = "chaoss_1"
-VIZ_ID = "tt-first-response"
+PAGE = "starterprojecthealth"
+VIZ_ID = "change-request-closure-ratio"
 
-gc_tt_first_response = dbc.Card(
+gc_change_request_closure_ratio = dbc.Card(
     [
         dbc.CardBody(
             [
                 html.H3(
-                    "Time to First Response",
+                    "Change Request Closure Ratio",
                     className="card-title",
                     style={"textAlign": "center"},
                 ),

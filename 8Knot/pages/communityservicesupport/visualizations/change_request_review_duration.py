@@ -7,23 +7,29 @@ import pandas as pd
 import logging
 from dateutil.relativedelta import *  # type: ignore
 import plotly.express as px
-from pages.utils.graph_utils import color_seq
-from queries.commits_query import commits_query as cmq
+from pages.utils.graph_utils import get_graph_time_values, color_seq
+from queries.prs_query import prs_query as prs
+from queries.pr_response_query import pr_response_query as prr
+from queries.pr_assignee_query import pr_assignee_query as pra
+from queries.change_request_review_query import change_request_review_query as crr
 import io
 from cache_manager.cache_manager import CacheManager as cm
 from pages.utils.job_utils import nodata_graph
 import time
+import datetime as dt
+import math
+import numpy as np
 
-PAGE = "chaoss_1"
-VIZ_ID = "cr-closure-ratio"
 
+PAGE = "Community Service and Support"
+VIZ_ID = "change-request-review-duration"
 
-gc_cr_closure_ratio = dbc.Card(
+gc_change_request_review_duration = dbc.Card(
     [
         dbc.CardBody(
             [
                 html.H3(
-                    "Change Request Closure Ratio",
+                    "Change Request Review Duration",
                     className="card-title",
                     style={"textAlign": "center"},
                 ),
@@ -31,10 +37,10 @@ gc_cr_closure_ratio = dbc.Card(
                     [
                         dbc.PopoverHeader("Graph Info:"),
                         dbc.PopoverBody(
-                            """
-                            Visualizes the distribution of Commit timestamps by Weekday or Hour.\n
-                            Helps to describe operating-hours of community code contributions.
-                            """
+                            """This visualization provides insights into the review process of change requests in a project. \n 
+                            It highlights aspects such as the extent of formal reviews, the number of reviews, the nature of comments, \n
+                            and the acceptance or decline of change requests. For more context of this visualization see \n
+                            https://chaoss.community/kb/metric-change-request-reviews/ \n """
                         ),
                     ],
                     id=f"popover-{PAGE}-{VIZ_ID}",
@@ -59,13 +65,11 @@ gc_cr_closure_ratio = dbc.Card(
                                         dbc.RadioItems(
                                             id=f"date-interval-{PAGE}-{VIZ_ID}",
                                             options=[
-                                                {
-                                                    "label": "Weekday",
-                                                    "value": "D",
-                                                },
-                                                {"label": "Hourly", "value": "H"},
+                                                {"label": "Trend", "value": "D"},
+                                                {"label": "Month", "value": "M"},
+                                                {"label": "Year", "value": "Y"},
                                             ],
-                                            value="D",
+                                            value="M",
                                             inline=True,
                                         ),
                                     ]
@@ -90,7 +94,6 @@ gc_cr_closure_ratio = dbc.Card(
     ],
 )
 
-
 # callback for graph info popover
 @callback(
     Output(f"popover-{PAGE}-{VIZ_ID}", "is_open"),
@@ -102,23 +105,25 @@ def toggle_popover(n, is_open):
         return not is_open
     return is_open
 
-
-# callback for VIZ TITLE graphx
+# callback for Change Request Review Duration graph
 @callback(
     Output(f"{PAGE}-{VIZ_ID}", "figure"),
+    # Output(f"check-alert-{PAGE}-{VIZ_ID}", "is_open"), USE WITH ADDITIONAL PARAMETERS
+    # if additional output is added, change returns accordingly
     [
         Input("repo-choices", "data"),
-        Input(f"date-interval-{PAGE}-{VIZ_ID}", "value"),
+        Input(f"date-radio-{PAGE}-{VIZ_ID}", "value"),
+        # add additional inputs here
     ],
     background=True,
 )
-def contrib_activity_cycle_graph(repolist, interval):
+def change_request_review_duration_graph(repolist, interval):
     # wait for data to asynchronously download and become available.
     cache = cm()
-    df = cache.grabm(func=cmq, repos=repolist)
+    df = cache.grabm(func=prs, repos=repolist)
     while df is None:
         time.sleep(1.0)
-        df = cache.grabm(func=cmq, repos=repolist)
+        df = cache.grabm(func=prs, repos=repolist)
 
     start = time.perf_counter()
     logging.warning(f"{VIZ_ID}- START")
@@ -138,64 +143,56 @@ def contrib_activity_cycle_graph(repolist, interval):
 
 
 def process_data(df: pd.DataFrame, interval):
-    # for this usecase we want the datetimes to be in their local values
-    # tricking pandas to keep local values when UTC conversion is required for to_datetime
-    df["author_timestamp"] = df["author_timestamp"].astype("str").str[:-6]
-    df["committer_timestamp"] = df["committer_timestamp"].astype("str").str[:-6]
-
     # convert to datetime objects rather than strings
-    df["author_timestamp"] = pd.to_datetime(df["author_timestamp"], utc=True)
-    df["committer_timestamp"] = pd.to_datetime(df["committer_timestamp"], utc=True)
-    # removes duplicate values when the author and committer is the same
-    df.loc[df["author_timestamp"] == df["committer_timestamp"], "author_timestamp"] = None
+    df["created"] = pd.to_datetime(df["created"], utc=True)
+    df["merged"] = pd.to_datetime(df["merged"], utc=True)
+    df["closed"] = pd.to_datetime(df["closed"], utc=True)
+    
+    # ensure pull request unique ID are formatted
+    #df["pull_request"] = df["pull_request"].astype(str)
+    #df["pull_request"] = df["pull_request"].str[:15]
 
-    df_final = pd.DataFrame()
+    # order values chronologically by creation date
+    df = df.sort_values(by="created", axis=0, ascending=True)
 
-    if interval == "H":
-        # combine the hour values for author and committer
-        hour = pd.concat([df["author_timestamp"].dt.hour, df["committer_timestamp"].dt.hour])
-        df_hour = pd.DataFrame(hour, columns=["Hour"])
-        df_final = df_hour.groupby(["Hour"])["Hour"].count()
-    else:
-        # combine the weekday values for author and committer
-        weekday = pd.concat(
-            [
-                df["author_timestamp"].dt.day_name(),
-                df["committer_timestamp"].dt.day_name(),
-            ]
-        )
-        df_weekday = pd.DataFrame(weekday, columns=["Weekday"])
-        df_final = df_weekday.groupby(["Weekday"])["Weekday"].count()
+    # first and last elements of the dataframe are the
+    # earliest and latest events respectively
+    earliest = df["created"].min()
+    latest = max(df["created"].max(), df["closed"].max())
 
-    return df_final
+    # generating buckets beginning to the end of time by the specified interval
+    dates = pd.date_range(start=earliest, end=latest, freq=interval, inclusive="both")
 
+    # df for new, staling, and stale prs for time interval
+    df_status = dates.to_frame(index=False, name="Date")
 
-def create_figure(df: pd.DataFrame, interval):
-    column = "Weekday"
-    order = [
-        "Sunday",
-        "Monday",
-        "Tuesday",
-        "Wednesday",
-        "Thursday",
-        "Friday",
-        "Saturday",
-    ]
-    if interval == "H":
-        column = "Hour"
+    # formatting for graph generation
+    if interval == "M":
+        df_status["Date"] = df_status["Date"].dt.strftime("%Y-%m")
+    elif interval == "Y":
+        df_status["Date"] = df_status["Date"].dt.year
 
-    fig = px.bar(df, y=column, color_discrete_sequence=[color_seq[3]])
-    hover = "%{x} Activity Count: %{y}<br>"
-    if interval == "H":
-        hover = "Hour: %{x}:00 Activity Count: %{y}<br>"
-    fig.update_traces(hovertemplate=hover)
-    fig.update_xaxes(
-        categoryorder="array",
-        categoryarray=order,
+    return df_status
+
+#TODO: Update the figure pieces
+def create_figure(df_status: pd.DataFrame, interval):
+    # time values for graph
+    x_r, x_name, hover, period = get_graph_time_values(interval)
+
+    fig = px.bar(
+        df_status,
+        x="Date",
+        y=["Rejected-Bot", "Rejected-Human", "Approved-Bot", "Approved-Human"],
+        color_discrete_sequence=[color_seq[1], color_seq[5], color_seq[2], color_seq[0]],
     )
+
+    # edit hover values
+    fig.update_traces(hovertemplate=hover + "<br>PRs: %{y}<br>" + "<extra></extra>")
+
     fig.update_layout(
-        yaxis_title="Activity Count",
-        xaxis_title=column,
+        xaxis_title="Time",
+        yaxis_title="Review Duration",
+        legend_title="Type",
         font=dict(size=14),
     )
 
