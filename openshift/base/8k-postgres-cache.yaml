@@ -1,0 +1,60 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-cache
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: eightknot-app
+  template:
+    spec:
+      containers:
+        - image: quay.io/enterprisedb/postgresql:16
+          name: postgresql
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - mountPath: /var/lib/postgresql/data
+              name: postgres-cache-data
+          envFrom:
+            - secretRef:
+                name: eightknot-postgres
+      restartpolicy: always
+      resources:
+        limits:
+          memory: 4Gi
+        requests:
+          memory: 128Mi
+      volumes:
+        - name: empty
+          emptyDir: {}
+        - name: postgres-cache-data
+          persistentVolumeClaim:
+            claimName: eightknot-postgres-cache-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-cache
+spec:
+  ports:
+    - name: postgresql
+      port: 5432
+      protocol: TCP
+      targetPort: 5432
+  selector:
+    name: eightknot-postgres-cache
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: eightknot-postgres-cache-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 128Gi
+  volumeMode: Filesystem

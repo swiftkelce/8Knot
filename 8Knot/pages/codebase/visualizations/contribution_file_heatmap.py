@@ -8,20 +8,19 @@ import pandas as pd
 import logging
 from dateutil.relativedelta import *  # type: ignore
 import plotly.express as px
-from pages.utils.graph_utils import get_graph_time_values, color_seq
-from queries.contributors_query import contributors_query as cnq
-from queries.cntrb_per_file_query import cntrb_per_file_query as cpfq
+from queries.prs_query import prs_query as prq
+from queries.pr_files_query import pr_file_query as prfq
 from queries.repo_files_query import repo_files_query as rfq
 from app import augur
+import io
 from pages.utils.job_utils import nodata_graph
-import pages.utils.preprocessing_utils as preproc_u
 import time
 from dash.exceptions import PreventUpdate
 import app
 import cache_manager.cache_facade as cf
 
 PAGE = "codebase"
-VIZ_ID = "cntrb-file-heatmap"
+VIZ_ID = "contribution-file-heatmap"
 
 # div to hold all objects to wait for loading to render
 graph_loading = html.Div(
@@ -31,13 +30,8 @@ graph_loading = html.Div(
                 dbc.PopoverHeader("Graph Info:"),
                 dbc.PopoverBody(
                     """
-                    This visualization analyzes the activity of the contributors to sub-sections (files or folders)
-                    of a repository. Specifically, this heatmap identifies the last time a sub-section's contributors
-                    (those people who have opened at least one pull request to a sub-section) last contributed to the
-                    repository. See the definition of "contribution" on the Info page for more information. This could be
-                    interpreted as monitoring technical knowledge retention of codebase components: if a sub-section's
-                    past contributors are no longer active in the repository, maintainership of that sub-section could
-                    be insufficient and require attention.
+                    This visualization analyzes the activity of the open or merged pull requests to sub-sections
+                    (files or folders) of a repository.
                     """
                 ),
             ],
@@ -84,6 +78,29 @@ graph_loading = html.Div(
                             ],
                             className="me-2",
                         ),
+                    ],
+                    align="center",
+                ),
+                dbc.Row(
+                    [
+                        dbc.Label(
+                            "Graph View:",
+                            html_for=f"graph-view-{PAGE}-{VIZ_ID}",
+                            width="auto",
+                        ),
+                        dbc.Col(
+                            [
+                                dbc.RadioItems(
+                                    id=f"graph-view-{PAGE}-{VIZ_ID}",
+                                    options=[
+                                        {"label": "PR Opened", "value": "created"},
+                                        {"label": "PR Merged", "value": "merged"},
+                                    ],
+                                    value="created",
+                                    inline=True,
+                                ),
+                            ]
+                        ),
                         dbc.Col(
                             dbc.Button(
                                 "About Graph",
@@ -102,12 +119,12 @@ graph_loading = html.Div(
     ],
 )
 
-gc_cntrb_file_heatmap = dbc.Card(
+gc_contribution_file_heatmap = dbc.Card(
     [
         dbc.CardBody(
             [
                 html.H3(
-                    "Contributor File Heatmap",
+                    "Contribution File Heatmap",
                     className="card-title",
                     style={"textAlign": "center"},
                 ),
@@ -186,9 +203,6 @@ def directory_dropdown(repo_id):
     path_slice = repo_id + "-" + repo_path + "/" + repo_name + "/"
     df["file_path"] = df["file_path"].str.rsplit(path_slice, n=1).str[1]
 
-    # drop columns not in the most recent collection
-    df = df[df["rl_analysis_date"] == df["rl_analysis_date"].max()]
-
     # drop unneccessary columns not needed after preprocessing steps
     df = df.reset_index()
     df.drop(
@@ -202,20 +216,19 @@ def directory_dropdown(repo_id):
 
     # take all of the files, split on the last instance of a / to get directories and top level files
     directories = df["file_path"].str.rsplit("/", n=1).str[0].tolist()
-    # applies another rsplit to make sure directories that only have folders are included
-    folder_only_directories = [x.rsplit("/", 1)[0] for x in directories]
-    directories = list(set(directories + folder_only_directories))
+    directories = list(set(directories))
 
     # get all of the file names to filter out of the directory set
     top_level_files = df["file_name"][df[1].isnull()].tolist()
-    directories = [f for f in directories if f not in top_level_files]
+    # applies another rsplit to make sure directories that only have folders are included
+    folder_only_directories = [x.rsplit("/", 1)[0] for x in directories]
+    directories = list(set(directories + folder_only_directories))
 
     # sort alphabetically
     directories = sorted(directories)
 
     # add top level directory to the list of directories
     directories.insert(0, "Top Level Directory")
-    logging.warning(f"DIRECTORY DROPDOWN - FINISHED")
 
     return directories, "Top Level Directory"
 
@@ -226,30 +239,30 @@ def directory_dropdown(repo_id):
     [
         Input(f"repo-{PAGE}-{VIZ_ID}", "value"),
         Input(f"directory-{PAGE}-{VIZ_ID}", "value"),
-        Input("bot-switch", "value"),
+        Input(f"graph-view-{PAGE}-{VIZ_ID}", "value"),
     ],
     background=True,
 )
-def cntrb_file_heatmap_graph(repo_id, directory, bot_switch):
+def cntrb_file_heatmap_graph(repo_id, directory, graph_view):
     start = time.perf_counter()
     logging.warning(f"{VIZ_ID}- START")
 
     # get dataframes of data from cache
-    df_file, df_actions, df_file_cntbs = multi_query_helper([repo_id])
+    df_file, df_file_pr, df_pr = multi_query_helper([repo_id])
 
     # test if there is data
-    if df_file.empty or df_actions.empty or df_file_cntbs.empty:
+    if df_file.empty or df_file_pr.empty or df_pr.empty:
         logging.warning(f"{VIZ_ID} - NO DATA AVAILABLE")
         return nodata_graph
 
     # function for all data pre processing
+    df = process_data(df_file, df_file_pr, df_pr, directory, graph_view)
 
-
-    # if there are no cntrbs in a directory plot no data graph
+    # if there are no pull request on a directory plot no data graph
     if df.empty:
         return nodata_graph
 
-    fig = create_figure(df)
+    fig = create_figure(df, graph_view)
 
     logging.warning(f"{VIZ_ID} - END - {time.perf_counter() - start}")
     return fig
@@ -264,17 +277,17 @@ def multi_query_helper(repos):
 
     # wait for data to asynchronously download and become available.
     while not_cached := cf.get_uncached(func_name=rfq.__name__, repolist=repos):
-        logging.warning(f"CONTRIBUTOR FILE HEATMAP - WAITING ON DATA TO BECOME AVAILABLE")
+        logging.warning(f"CONTRIBUTION FILE HEATMAP - WAITING ON DATA TO BECOME AVAILABLE")
         time.sleep(0.5)
 
     # wait for data to asynchronously download and become available.
-    while not_cached := cf.get_uncached(func_name=cnq.__name__, repolist=repos):
-        logging.warning(f"CONTRIBUTOR FILE HEATMAP - WAITING ON DATA TO BECOME AVAILABLE")
+    while not_cached := cf.get_uncached(func_name=prfq.__name__, repolist=repos):
+        logging.warning(f"CONTRIBUTION FILE HEATMAP - WAITING ON DATA TO BECOME AVAILABLE")
         time.sleep(0.5)
 
     # wait for data to asynchronously download and become available.
-    while not_cached := cf.get_uncached(func_name=cpfq.__name__, repolist=repos):
-        logging.warning(f"CONTRIBUTOR FILE HEATMAP - WAITING ON DATA TO BECOME AVAILABLE")
+    while not_cached := cf.get_uncached(func_name=prq.__name__, repolist=repos):
+        logging.warning(f"CONTRIBUTION FILE HEATMAP - WAITING ON DATA TO BECOME AVAILABLE")
         time.sleep(0.5)
 
     # GET ALL DATA FROM POSTGRES CACHE
@@ -282,28 +295,24 @@ def multi_query_helper(repos):
         tablename=rfq.__name__,
         repolist=repos,
     )
-    df_actions = cf.retrieve_from_cache(
-        tablename=cnq.__name__,
+    df_file_pr = cf.retrieve_from_cache(
+        tablename=prfq.__name__,
         repolist=repos,
     )
-    df_file_cntrbs = cf.retrieve_from_cache(
-        tablename=cpfq.__name__,
+    df_pr = cf.retrieve_from_cache(
+        tablename=prq.__name__,
         repolist=repos,
     )
 
-    # necessary preprocessing steps that were lifted out of the querying step
-    df_actions = preproc_u.contributors_df_action_naming(df_actions)
-    df_file_cntrbs = preproc_u.cntrb_per_file(df_file_cntrbs)
-
-    return df_file, df_actions, df_file_cntrbs
+    return df_file, df_file_pr, df_pr
 
 
 def process_data(
     df_file: pd.DataFrame,
-    df_actions: pd.DataFrame,
-    df_file_cntbs: pd.DataFrame,
+    df_file_pr: pd.DataFrame,
+    df_pr: pd.DataFrame,
     directory,
-    bot_switch,
+    graph_view,
 ):
     # strings to hold the values for each column (always the same for every row of this query)
     repo_name = df_file["repo_name"].iloc[0]
@@ -314,6 +323,9 @@ def process_data(
     path_slice = repo_id + "-" + repo_path + "/" + repo_name + "/"
     df_file["file_path"] = df_file["file_path"].str.rsplit(path_slice, n=1).str[1]
 
+    # drop columns not in the most recent collection
+    df_file = df_file[df_file["rl_analysis_date"] == df_file["rl_analysis_date"].max()]
+
     # drop unneccessary columns not needed after preprocessing steps
     df_file = df_file.reset_index()
     df_file.drop(["index", "repo_name", "repo_path", "rl_analysis_date"], axis=1, inplace=True)
@@ -323,25 +335,14 @@ def process_data(
 
     # drop unnecessary columns
     df_file.drop(["id"], axis=1, inplace=True)
-    df_file_cntbs.drop(["id"], axis=1, inplace=True)
+    df_file_pr.drop(["id"], axis=1, inplace=True)
+
+    # create column with list of prs per file path
+    df_file_pr = df_file_pr.groupby("file_path")["pull_request"].apply(list)
 
     # Left join on df_files to only get the files that are currently in the repository
     # and the contributors that have ever opened a pr that included edits on the file
-    df_file = pd.merge(df_file, df_file_cntbs, on="file_path", how="left")
-    # replace nan with empty string to avoid errors in list comprehension
-    df_file.cntrb_ids.fillna("", inplace=True)
-
-    # reformat cntrb_ids to list and remove bots if filter is on
-    if bot_switch:
-        df_file["cntrb_ids"] = df_file.apply(
-            lambda row: [x for x in row.cntrb_ids if x not in app.bots_list],
-            axis=1,
-        )
-    else:
-        df_file["cntrb_ids"] = df_file.apply(
-            lambda row: [x for x in row.cntrb_ids],
-            axis=1,
-        )
+    df_file = pd.merge(df_file, df_file_pr, on="file_path", how="left")
 
     # determine directory level to use in later step
     level = directory.count("/")
@@ -352,92 +353,97 @@ def process_data(
     # get all of the files in the directory or nested in folders in the directory
     df_dynamic_directory = df_file[df_file["file_path"].str.startswith(directory)]
 
-    # number of files in the directory or nested in folders in the directory that have no contributors
-    num_empty_cntrb = df_dynamic_directory[df_dynamic_directory["cntrb_ids"].str.len() == 0].shape[0]
-
-    # return empty df if all of the files in the directory or nested in folders in the directory have
-    # no contributors
-    if num_empty_cntrb == df_dynamic_directory.shape[0]:
+    # test if there is any pull requests in the directory
+    if df_dynamic_directory.pull_request.isnull().all():
         return pd.DataFrame()
 
     # get one level up from the directory level
     group_column = level + 1
 
     # Groupby the level above the selected directory for all files nested in folders are together.
-    # For each, create a list of all of the contributors who have contributed
+    # For each, create a list of all of pull request that include that file
     df_dynamic_directory = (
-        df_dynamic_directory.groupby(group_column)["cntrb_ids"]
+        df_dynamic_directory.groupby(group_column)["pull_request"]
         .sum()
         .reset_index()
         .rename(columns={group_column: "directory_value"})
     )
 
-    # Set of cntrb_ids to confirm there are no duplicate cntrb_ids
-    df_dynamic_directory["cntrb_ids"] = df_dynamic_directory.apply(
-        lambda row: set(row.cntrb_ids),
+    # reformat 0 to "" for later processing
+    df_dynamic_directory.loc[df_dynamic_directory.pull_request == 0, "pull_request"] = ""
+
+    # Set of pull_request to confirm there are no duplicate pull requests
+    df_dynamic_directory["pull_request"] = df_dynamic_directory.apply(
+        lambda row: set(row.pull_request),
         axis=1,
     )
 
     # date reformating
-    df_actions["created_at"] = pd.to_datetime(df_actions["created_at"], utc=True)
-
-    # sort by created_at date latest to earliest and only keep a contributors most recent activity
-    df_actions = df_actions.sort_values(by="created_at", axis=0, ascending=False)
-    df_actions = df_actions.drop_duplicates(subset="cntrb_id", keep="first")
+    df_pr["created"] = pd.to_datetime(df_pr["created"], utc=True)
+    df_pr["merged"] = pd.to_datetime(df_pr["merged"], utc=True)
 
     # drop unneccessary columns not needed after preprocessing steps
-    df_actions = df_actions.reset_index()
-    df_actions.drop(["index", "id", "repo_name", "login", "Action", "rank"], axis=1, inplace=True)
+    df_pr.drop(["id", "repo_name", "pr_src_number", "cntrb_id", "closed"], axis=1, inplace=True)
 
-    # dictionary of cntrb_ids and their most recent activity on repo
-    last_contrb = df_actions.set_index("cntrb_id")["created_at"].to_dict()
+    # dictionaries of pull_requests and their open and merge dates
+    pr_open = df_pr.set_index("pull_request")["created"].to_dict()
+    pr_merged = df_pr.set_index("pull_request")["merged"].to_dict()
 
-    # get list of dates of the most recent activity for each contributor for each file
-    df_dynamic_directory["dates"] = df_dynamic_directory.apply(
-        lambda row: [last_contrb[x] for x in row.cntrb_ids],
-        axis=1,
+    # get list of pr created and merged dates for each pr
+    df_dynamic_directory["created"], df_dynamic_directory["merged"] = zip(
+        *df_dynamic_directory.apply(
+            lambda row: [
+                [pr_open[x] for x in row.pull_request],
+                [pr_merged[x] for x in row.pull_request if (not pd.isnull(pr_merged[x]))],
+            ],
+            axis=1,
+        )
     )
 
-    # reformat into each row being a directory value and a date of one of the contributors
-    # most recent activity - preprocessing step
-    df_dynamic_directory = df_dynamic_directory.explode("dates")
+    # reformat into each row being a directory value and a date of one of the pull request dates
+    df_dynamic_directory = df_dynamic_directory.explode(graph_view)
 
-    # get files that have no contributors and remove from set to prevent errors in grouper function
-    no_contribs = df_dynamic_directory["directory_value"][df_dynamic_directory.dates.isnull()].tolist()
+    # get files that have no pull requests and remove from set to prevent errors in grouper function
+    no_contribs = df_dynamic_directory["directory_value"][df_dynamic_directory[graph_view].isnull()].tolist()
 
-    df_dynamic_directory = df_dynamic_directory[~df_dynamic_directory.dates.isnull()]
+    df_dynamic_directory = df_dynamic_directory[~df_dynamic_directory[graph_view].isnull()]
 
     """Creates df with a column for each month between start and end date. This will be used to confirm that
-    there will be a column for every month even if there is no "last contribution" date in it. This greatly
+    there will be a column for every month even if there is no pull request date in it. This greatly
     improves the heatmap ploting"""
 
-    # dates based on action so it represents the length of the project
-    min_date = df_actions.created_at.min()
-    max_date = df_actions.created_at.max()
+    # dates based on creation and closed dates so it represents the length of the project
+    min_date = df_pr.created.min()
+    max_date = max(df_pr["created"].max(), df_pr["merged"].max())
     dates = pd.date_range(start=min_date, end=max_date, freq="M", inclusive="both")
-    df_fill = dates.to_frame(index=False, name="dates")
+    df_fill = dates.to_frame(index=False, name=graph_view)
 
     # combine df with data and filler dates together
     final = pd.concat([df_dynamic_directory, df_fill], axis=0)
     final["directory_value"] = final["directory_value"].astype(str)
 
-    # grouping dates by every month and counting the number of contributors with the last activity at that date
-    final = final.groupby(pd.Grouper(key="dates", freq="1M"))["directory_value"].value_counts().unstack(0)
+    # grouping dates by every month and counting the number of pr opened or merged with the last activity at that date
+    final = final.groupby(pd.Grouper(key=graph_view, freq="1M"))["directory_value"].value_counts().unstack(0)
 
-    # removing the None row that was used for column formating
-    final.drop("nan", inplace=True)
+    # removing the None row that was used for column formating if exists
+    if "nan" in final.index:
+        final.drop("nan", inplace=True)
 
-    # add back the files that had no contributors
+    # add back the files that had no pull requests
     for files in no_contribs:
         final.loc[files] = None
 
     return final
 
 
-def create_figure(df: pd.DataFrame):
+def create_figure(df: pd.DataFrame, graph_view):
+    legend_title = "PRs Opened"
+    if graph_view == "merged":
+        legend_title = "PRs Merged"
+
     fig = px.imshow(
         df,
-        labels=dict(x="Time", y="Directory Entries", color="Contributors"),
+        labels=dict(x="Time", y="Directory Entries", color=legend_title),
         color_continuous_scale=px.colors.sequential.deep,
     )
 

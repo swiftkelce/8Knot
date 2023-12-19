@@ -9,22 +9,20 @@ from dateutil.relativedelta import *  # type: ignore
 import plotly.express as px
 from pages.utils.graph_utils import get_graph_time_values, color_seq
 from queries.pr_response_query import pr_response_query as prr
-import io
-from cache_manager.cache_manager import CacheManager as cm
-import cache_manager.cache_facade as cf
 from pages.utils.job_utils import nodata_graph
 import time
 import app
+import cache_manager.cache_facade as cf
 
 PAGE = "contributions"
-VIZ_ID = "pr-first-response"
+VIZ_ID = "pr-review-response"
 
-gc_pr_first_response = dbc.Card(
+gc_pr_review_response = dbc.Card(
     [
         dbc.CardBody(
             [
                 html.H3(
-                    "Pull Request Time to First Response",
+                    "Pull Request Conversation Engagement",
                     className="card-title",
                     style={"textAlign": "center"},
                 ),
@@ -33,8 +31,9 @@ gc_pr_first_response = dbc.Card(
                         dbc.PopoverHeader("Graph Info:"),
                         dbc.PopoverBody(
                             """
-                            Compares the volume of PRs being opened against the number of those PRs that \n
-                            receive at least one response within the parameterized timeframe after being opened.
+                            Tracks the number of PRs that are open on a given day vs. those that have
+                            received a comment or a review within a time interval, or that are waiting
+                            on a response from the opener.
                             """
                         ),
                     ],
@@ -105,7 +104,7 @@ def toggle_popover(n, is_open):
     return is_open
 
 
-# callback for pr first response graph
+# callback for pr review response graph
 @callback(
     Output(f"{PAGE}-{VIZ_ID}", "figure"),
     [
@@ -115,7 +114,7 @@ def toggle_popover(n, is_open):
     ],
     background=True,
 )
-def pr_first_response_graph(repolist, num_days, bot_switch):
+def pr_review_response_graph(repolist, num_days, bot_switch):
     while not_cached := cf.get_uncached(func_name=prr.__name__, repolist=repolist):
         logging.warning(f"PR_FIRST_RESPONSE - WAITING ON DATA TO BECOME AVAILABLE")
         time.sleep(0.5)
@@ -152,12 +151,11 @@ def process_data(df: pd.DataFrame, num_days):
     df["pr_created_at"] = pd.to_datetime(df["pr_created_at"], utc=True)
     df["pr_closed_at"] = pd.to_datetime(df["pr_closed_at"], utc=True)
 
-    # drop messages from the pr creator
-    df = df[df["cntrb_id"] != df["msg_cntrb_id"]]
-
     # sort in ascending earlier and only get ealiest value
     df = df.sort_values(by="msg_timestamp", axis=0, ascending=True)
-    df = df.drop_duplicates(subset="pull_request_id", keep="first")
+
+    # 1 row per pr with either null msg date or most recent if one exists
+    df = df.drop_duplicates(subset="pull_request_id", keep="last")
 
     # first and last elements of the dataframe are the
     # earliest and latest events respectively
@@ -218,8 +216,8 @@ def create_figure(df: pd.DataFrame, num_days):
 
 def get_open_response(df, date, num_days):
     """
-    This function takes a date and determines how many
-    prs in that time interval are opened and if they have a response within num_days.
+    This function takes a date and determines how many prs in that time interval are
+    open and if they have a response within num_days or waiting on pr openers response.
 
     Args:
     -----
@@ -234,27 +232,45 @@ def get_open_response(df, date, num_days):
 
     Returns:
     --------
-        int, int: Number of opened and responded to prs within num_days on the day
+        int, int: number of open prs, and number of prs responded to within num_days or waiting on pr openers response
     """
-    # drop rows that are more recent than the date limit
+
+    # drop rows with prs that have been created after the date
     df_created = df[df["pr_created_at"] <= date]
 
-    # drops rows that have been closed after date
-    df_open = df_created[df_created["pr_closed_at"] > date]
+    # drops rows that have been closed before date
+    df_open_at_date = df_created[df_created["pr_closed_at"] > date]
 
     # include prs that have not been close yet
-    df_open = pd.concat([df_open, df_created[df_created.pr_closed_at.isnull()]])
+    df_open_at_date = pd.concat([df_open_at_date, df_created[df_created.pr_closed_at.isnull()]])
 
-    # column to hold date num_days after the pr_creation date for comparision
-    df_open["response_by"] = df_open["pr_created_at"] + pd.DateOffset(days=num_days)
+    # number of columns in df ie number of open prs
+    num_open = df_open_at_date.shape[0]
 
-    # Inlcude only the prs that msg timestamp is before the responded by time
-    df_response = df_open[df_open["msg_timestamp"] < df_open["response_by"]]
+    # get all prs that have atleast one response
+    df_response = df_open_at_date[df_open_at_date["msg_timestamp"].notnull()]
 
-    # generates number of columns ie open prs
-    num_open = df_open.shape[0]
+    # if no messages for any of the open prs, return num_open and 0
+    if len(df_response.index) == 0:
+        return num_open, 0
 
-    # number of prs that had response in time interval
-    num_response = df_response.shape[0]
+    # drop messages that happen after date considered
+    df_messages_in_range = df_open_at_date[df_open_at_date["msg_timestamp"] < date]
 
-    return num_open, num_response
+    # order messages from earliest to latest by timestamp
+    df_messages_in_range = df_messages_in_range.sort_values(by="msg_timestamp", axis=0, ascending=True)
+
+    # threshold of when the last response would need to be by
+    before_date_by_num_days = date - pd.DateOffset(days=num_days)
+
+    # checks if the most recent message was within the date requirement or by someone other than
+    # the pr creator
+    df_responded_to_by_deadline = df_messages_in_range[
+        (df_messages_in_range["msg_timestamp"] > before_date_by_num_days)
+        | (df_messages_in_range["msg_cntrb_id"] != df_messages_in_range["cntrb_id"])
+    ]
+
+    # generates number of columns ie prs with a response within num_days or waiting on pr openers response
+    n_met_response_criteria = df_responded_to_by_deadline.shape[0]
+
+    return num_open, n_met_response_criteria
