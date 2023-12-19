@@ -243,7 +243,7 @@ def cntrb_file_heatmap_graph(repo_id, directory, bot_switch):
         return nodata_graph
 
     # function for all data pre processing
-    df = process_data(df_file, df_actions, df_file_cntbs, directory, bot_switch)
+
 
     # if there are no cntrbs in a directory plot no data graph
     if df.empty:
